@@ -1,60 +1,112 @@
+import collections
 import csv
-from decimal import Decimal
+import os
+
+BulkValue = collections.namedtuple('BulkValue', ['cutoff', 'value'])
+
+BULK_VALUES = {
+  'L': BulkValue(0.5, 0.00),
+  'FL': BulkValue(0.5, 0.05),
+  'C': BulkValue(0.5, 0.001),
+  'FC': BulkValue(0.5, 0.05),
+  'U': BulkValue(0.5, 0.001),
+  'FU': BulkValue(0.5, 0.05),
+  'R': BulkValue(1.0, 0.10),
+  'FR': BulkValue(1.0, 0.20),
+  'M': BulkValue(1.0, 0.20),
+  'FM': BulkValue(1.0, 1.00),
+}
+
+DEFAULT_FOIL_MULTIPLIER = 2.0
+
+DATA_DIR = os.path.join('.', 'data')
+SETS_FILENAME = os.path.join(DATA_DIR, 'sets.csv')
 
 
-NUMBER_BOXES = 6
-NUMBER_PACKS = NUMBER_BOXES*36
-BULK_LOT_PRICE = 25.00
+def cell_to_float(cell_string):
+  if '/' in cell_string:
+    n, d = cell_string.split('/')
+  else:
+    n, d = cell_string, '1'
+  return float(n) / float(d)
 
-def _default_dict():
-    return {'C': 0, 'U': 0, 'R': 0, 'M': 0,}
+
+def parse_pack_distributions():
+  sets_data = {}
+  with open(SETS_FILENAME, 'rb') as sets_datafile:
+    sets_reader = csv.DictReader(sets_datafile)
+    for row in sets_reader:
+      set_name = row.pop('Set')
+      set = collections.defaultdict(lambda: 0.0)
+      foil_multiplier = cell_to_float(row.pop('F', 0.0))
+      for rarity, frequency in row.items():
+        frequency = cell_to_float(frequency)
+        set[rarity] = frequency
+        set['F%s' % rarity] = foil_multiplier * frequency
+      sets_data[set_name] = set
+  return sets_data
+
+
+def price_or_bulk(rarity, price):
+  if rarity not in BULK_VALUES:
+    return price
+  bulkvalue = BULK_VALUES[rarity]
+  if price < bulkvalue.cutoff:
+    return bulkvalue.value
+  else:
+    return price
+
+
+def parse_set_data(set_code):
+  set_filename = os.path.join(DATA_DIR, '%s.csv' % set_code)
+  if not os.path.exists(set_filename):
+    return collections.defaultdict(lambda: 0.0)
+  counts = collections.defaultdict(lambda: 0)
+  sums = collections.defaultdict(lambda: 0.0)
+  with open(set_filename, 'rb') as set_datafile:
+    set_reader = csv.DictReader(set_datafile)
+    for row in set_reader:
+      rarity = row['Rarity'].strip()
+      frarity = 'F%s' % rarity
+
+      price = float(row['Mid'].strip().replace('$', ''))
+      if 'Foil Mid' in row:
+        fprice = float(row['Foil Mid'].strip().replace('$', ''))
+      elif 'Foil' in row:
+        fprice = float(row['Foil'].strip().replace('$', ''))
+      else:
+        fprice = DEFAULT_FOIL_MULTIPLIER * price
+
+      counts[rarity] += 1
+      counts[frarity] += 1
+      sums[rarity] += price_or_bulk(rarity, price)
+      sums[frarity] += price_or_bulk(frarity, fprice)
+  averages = collections.defaultdict(lambda: 0.0)
+  for rarity, sum in sums.items():
+    averages[rarity] = sum / float(counts[rarity])
+  return averages
+
+
+def get_pack_ev(set_distribution, set_averages):
+  sum = 0.0
+  for rarity, frequency in set_distribution.items():
+    sum += frequency * set_averages[rarity]
+  return sum
+
 
 def main():
-    r = csv.reader(open('theros-tcg.csv', 'rb'), delimiter=';')
-    r.next()
-    total_price = _default_dict()
-    total_foil_price = 0
-    set_count = _default_dict()
-    average_price = _default_dict()
+  set_distributions = parse_pack_distributions()
+  set_averages = {
+      set_code: parse_set_data(set_code) for set_code in set_distributions}
+  pack_evs = {}
+  for set_code, set_distribution in set_distributions.items():
+    set_average = parse_set_data(set_code)
+    pack_evs[set_code] = get_pack_ev(set_distribution, set_average)
 
-    for row in r:
-        rarity = row[4].strip()
-        if rarity in total_price:
-            total_price[rarity] += Decimal(row[6].strip()[1:])
-            total_foil_price += Decimal(row[6].strip()[1:]) * Decimal(2.25)
-            set_count[rarity] += 1
+  print 'Pack values'
+  for set_code, ev in pack_evs.items():
+    print ' > %s - $%0.2f' % (set_code, ev)
 
-    for k,v in total_price.iteritems():
-        average_price[k] = Decimal(v/set_count[k])
-    
-    mythics_pulled = Decimal(float(1) / float(8)) * NUMBER_PACKS
-    mythics_price = mythics_pulled * average_price['M']
-    
-    rares_pulled = (NUMBER_PACKS - mythics_pulled)
-    rares_price = rares_pulled * average_price['R']
-
-    uncommons_pulled = 3 * NUMBER_PACKS
-    uncommons_price =  uncommons_pulled * average_price['U']
-    
-    commons_pulled = 9 * NUMBER_PACKS
-    commons_price = commons_pulled * average_price['C']
-    
-    average_foil_price = Decimal(total_foil_price/sum(set_count.values()))
-    foils_pulled = Decimal(float(1) / float(6)) * NUMBER_PACKS
-    foils_price = foils_pulled * average_foil_price
-
-    uncommon_bulk_pulled = ((float(1) / float(set_count['U'])) * float(uncommons_pulled - foils_pulled)) / 4
-    bulk_uncommon_playsets = Decimal(BULK_LOT_PRICE * uncommon_bulk_pulled)
-
-    total_box_ev = (mythics_price + rares_price + foils_price + bulk_uncommon_playsets)/NUMBER_BOXES
-
-    print "     >>> Foils Pulled: {0:0.0f} at an average price of ${1:0.2f}".format(foils_pulled, average_foil_price)
-    print "     >>> Mythics Pulled: {0:0.0f} at an average price of ${1:0.2f}".format(mythics_pulled, average_price['M'])
-    print "     >>> Rares Pulled: {0:0.0f} at an average price of ${1:0.2f}".format(rares_pulled, average_price['R'])
-    #print "     >>> Uncommons Pulled: {0:0.0f} at an average price of ${1:0.2f}".format(uncommons_pulled, average_price['U'])
-    #print "     >>> Commons Pulled: {0:0.0f} at an average price of ${1:0.2f}".format(commons_pulled, average_price['C'])
-    print "     >>> Bulk Uncommon/Common Play Sets: {0:0.2f} at an average price of ${1:0.2f}".format(uncommon_bulk_pulled, BULK_LOT_PRICE)
-    print "     >>> Total Box Estimated Value: ${:0.2f}".format(total_box_ev)
 
 if __name__ == '__main__':
     main()
